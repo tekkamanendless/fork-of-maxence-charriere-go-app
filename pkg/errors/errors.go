@@ -1,35 +1,16 @@
 package errors
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
 	"reflect"
 	"runtime"
-)
-
-var (
-	// The function used to encode errors and their tags.
-	Encoder func(any) ([]byte, error)
+	"strconv"
 )
 
 func init() {
 	SetInlineEncoder()
-}
-
-// SetInlineEncoder is a helper function that set the error encoder to
-// json.Marshal.
-func SetInlineEncoder() {
-	Encoder = json.Marshal
-}
-
-// SetIndentEncoder is a helper function that set the error encoder to a
-// function that uses json.MarshalIndent.
-func SetIndentEncoder() {
-	Encoder = func(v any) ([]byte, error) {
-		return json.MarshalIndent(v, "", "  ")
-	}
 }
 
 // Unwrap returns the result of calling the Unwrap method on err, if err's type
@@ -115,16 +96,31 @@ func HasType(err error, v string) bool {
 	}
 }
 
+// UIError returns the UI message attached to err if present in the error chain.
+// Otherwise it returns the default error string.
+func UIError(err error) string {
+	if err == nil {
+		return ""
+	}
+
+	for current := err; current != nil; current = Unwrap(current) {
+		if err, ok := current.(interface{ UIError() string }); ok {
+			return err.UIError()
+		}
+	}
+	return err.Error()
+}
+
 // Tag returns the first tag value in err's chain that matches the given key.
 //
 // The chain consists of err itself followed by the sequence of errors obtained
 // by repeatedly calling Unwrap.
 //
-// An error has a tag when it has a method Tag(string) string such that Tag(k)
-// returns a non-empty string value.
+// An error has a tag when it has a method Tag(string) any such that Tag(k)
+// returns a non-nil value.
 func Tag(err error, k string) any {
 	for {
-		if err, ok := err.(Error); ok {
+		if err, ok := err.(interface{ Tag(string) any }); ok {
 			if v := err.Tag(k); v != nil {
 				return v
 			}
@@ -141,6 +137,7 @@ type Error struct {
 	Line        string
 	Message     string
 	DefinedType string
+	UIMessage   string
 	Tags        map[string]any
 	WrappedErr  error
 }
@@ -161,17 +158,22 @@ func makeError(v string) Error {
 	_, filename, line, _ := runtime.Caller(2)
 
 	err := Error{
-		Line:    fmt.Sprintf("%s:%v", filepath.Base(filename), line),
+		Line:    filepath.Base(filename) + ":" + strconv.Itoa(line),
 		Message: v,
 	}
 	return err
 }
 
+// WithType sets the application-defined type of the error.
 func (e Error) WithType(v string) Error {
 	e.DefinedType = v
 	return e
 }
 
+// Type returns the application-defined type of the error.
+//
+// When no explicit type is set, the wrapped error type is returned if present.
+// Otherwise, it returns the Go type of Error.
 func (e Error) Type() string {
 	if e.DefinedType != "" {
 		return e.DefinedType
@@ -184,6 +186,7 @@ func (e Error) Type() string {
 	return reflect.TypeOf(e).String()
 }
 
+// WithTag sets the named tag with the given value.
 func (e Error) WithTag(k string, v any) Error {
 	if e.Tags == nil {
 		e.Tags = make(map[string]any)
@@ -193,62 +196,51 @@ func (e Error) WithTag(k string, v any) Error {
 	return e
 }
 
+// Tag returns the value associated with the given tag key.
 func (e Error) Tag(k string) any {
 	return e.Tags[k]
 }
 
+// WithUIError sets the message intended to be displayed in the UI.
+func (e Error) WithUIError(msg string) Error {
+	e.UIMessage = msg
+	return e
+}
+
+// UIError returns the message intended to be displayed in the UI.
+func (e Error) UIError() string {
+	if e.UIMessage == "" {
+		return e.Error()
+	}
+	return e.UIMessage
+}
+
+// Wrap sets the wrapped error.
 func (e Error) Wrap(err error) Error {
 	e.WrappedErr = err
 	return e
 }
 
+// Unwrap returns the wrapped error.
 func (e Error) Unwrap() error {
 	return e.WrappedErr
 }
 
+// Error returns the string representation of the error.
 func (e Error) Error() string {
-	s, err := Encoder(e)
+	s, err := getEncoder()(makeJSONError(e))
 	if err != nil {
 		return fmt.Sprintf(`{"message": "encoding error failed: %s"}`, err)
 	}
 	return string(s)
 }
 
+// MarshalJSON returns the JSON representation of the error.
 func (e Error) MarshalJSON() ([]byte, error) {
-	var wrappedErr any = e.WrappedErr
-	if _, ok := e.WrappedErr.(Error); !ok && e.WrappedErr != nil {
-		wrappedErr = e.WrappedErr.Error()
-	}
-
-	var tags map[string]any
-	if l := len(e.Tags); l != 0 {
-		tags = make(map[string]any, l)
-		for k, v := range e.Tags {
-			switch v := v.(type) {
-			case reflect.Type:
-				tags[k] = v.String()
-
-			default:
-				tags[k] = v
-			}
-		}
-	}
-
-	return Encoder(struct {
-		Line        string         `json:"line,omitempty"`
-		Message     string         `json:"message"`
-		DefinedType string         `json:"type,omitempty"`
-		Tags        map[string]any `json:"tags,omitempty"`
-		WrappedErr  any            `json:"wrap,omitempty"`
-	}{
-		Line:        e.Line,
-		Message:     e.Message,
-		DefinedType: e.DefinedType,
-		Tags:        tags,
-		WrappedErr:  wrappedErr,
-	})
+	return getEncoder()(makeJSONError(e))
 }
 
+// Is reports whether err matches the receiver.
 func (e Error) Is(err error) bool {
 	rerr, ok := err.(Error)
 	if !ok {
@@ -259,5 +251,91 @@ func (e Error) Is(err error) bool {
 		rerr.Message == e.Message &&
 		rerr.DefinedType == e.DefinedType &&
 		reflect.DeepEqual(rerr.Tags, e.Tags) &&
-		rerr.WrappedErr == e.WrappedErr
+		isSameErr(rerr.WrappedErr, e.WrappedErr)
+}
+
+func isSameErr(a, b error) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+
+	ta := reflect.TypeOf(a)
+	tb := reflect.TypeOf(b)
+	if ta != tb || !ta.Comparable() {
+		return false
+	}
+
+	return a == b
+}
+
+type jsonError struct {
+	Line        string         `json:"line,omitempty"`
+	Message     string         `json:"message"`
+	UIMessage   string         `json:"ui,omitempty"`
+	DefinedType string         `json:"type,omitempty"`
+	Tags        map[string]any `json:"tags,omitempty"`
+	WrappedErr  any            `json:"wrap,omitempty"`
+}
+
+func makeJSONError(err Error) jsonError {
+	tags := makeJSONTags(err.Tags)
+
+	return jsonError{
+		Line:        err.Line,
+		Message:     err.Message,
+		UIMessage:   err.UIMessage,
+		DefinedType: err.DefinedType,
+		Tags:        tags,
+		WrappedErr:  makeJSONWrappedErr(err.WrappedErr),
+	}
+}
+
+func makeJSONWrappedErr(err error) any {
+	switch err := err.(type) {
+	case nil:
+		return nil
+
+	case Error:
+		return makeJSONError(err)
+
+	case *Error:
+		if err == nil {
+			return nil
+		}
+		return makeJSONError(*err)
+
+	default:
+		return err.Error()
+	}
+}
+
+func makeJSONTags(tags map[string]any) map[string]any {
+	if len(tags) == 0 {
+		return nil
+	}
+
+	requiresNormalization := false
+normalizationLoop:
+	for _, v := range tags {
+		switch v.(type) {
+		case reflect.Type:
+			requiresNormalization = true
+			break normalizationLoop
+		}
+	}
+	if !requiresNormalization {
+		return tags
+	}
+
+	jsonTags := make(map[string]any, len(tags))
+	for k, v := range tags {
+		switch v := v.(type) {
+		case reflect.Type:
+			jsonTags[k] = v.String()
+
+		default:
+			jsonTags[k] = v
+		}
+	}
+	return jsonTags
 }

@@ -26,7 +26,7 @@ func (a attributes) Set(name string, value any) {
 		v = toAttributeValue(value)
 	}
 
-	switch v {
+	switch name {
 	case "cite",
 		"data",
 		"download",
