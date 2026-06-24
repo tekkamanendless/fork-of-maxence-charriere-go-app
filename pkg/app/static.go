@@ -21,6 +21,10 @@ import (
 // Note that app.wasm must still be built separately and put into the web
 // directory.
 func GenerateStaticWebsite(dir string, h *Handler, pages ...string) error {
+	return GenerateStaticWebsiteFromMux(dir, h, pages...)
+}
+
+func GenerateStaticWebsiteFromMux(dir string, h http.Handler, pages ...string) error {
 	if dir == "" {
 		dir = "."
 	}
