@@ -4,6 +4,7 @@
 package app
 
 import (
+	stderrors "errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -17,6 +18,9 @@ import (
 // GenerateStaticWebsite generates the files to run a PWA built with go-app as a
 // static website in the specified directory. Static websites can be used with
 // hosts such as Github Pages.
+//
+// Generation stops if a resource does not return HTTP 200 or cannot be saved.
+// Files successfully generated before an error are retained.
 //
 // Note that app.wasm must still be built separately and put into the web
 // directory.
@@ -75,15 +79,6 @@ func GenerateStaticWebsiteFromMux(dir string, h http.Handler, pages ...string) e
 				filename = "/index.html"
 			}
 
-			f, err := createStaticFile(dir, filename)
-			if err != nil {
-				return errors.New("creating file failed").
-					WithTag("path", path).
-					WithTag("filename", filename).
-					Wrap(err)
-			}
-			defer f.Close()
-
 			page, err := createStaticPage(server.URL + path)
 			if err != nil {
 				return errors.New("creating page failed").
@@ -92,11 +87,18 @@ func GenerateStaticWebsiteFromMux(dir string, h http.Handler, pages ...string) e
 					Wrap(err)
 			}
 
-			if n, err := f.Write(page); err != nil {
-				return errors.New("writing page failed").
+			f, err := createStaticFile(dir, filename)
+			if err != nil {
+				return errors.New("creating file failed").
 					WithTag("path", path).
 					WithTag("filename", filename).
-					WithTag("bytes-written", n).
+					Wrap(err)
+			}
+
+			if err := writeStaticPage(f, page); err != nil {
+				return errors.New("saving page failed").
+					WithTag("path", path).
+					WithTag("filename", filename).
 					Wrap(err)
 			}
 		}
@@ -106,11 +108,7 @@ func GenerateStaticWebsiteFromMux(dir string, h http.Handler, pages ...string) e
 }
 
 func createStaticDir(dir, path string) error {
-	dir = filepath.Join(dir, filepath.Dir(path))
-	if _, err := os.Stat(dir); !os.IsNotExist(err) {
-		return nil
-	}
-	return os.MkdirAll(filepath.Join(dir), 0755)
+	return os.MkdirAll(filepath.Join(dir, filepath.Dir(path)), 0755)
 }
 
 func createStaticFile(dir, path string) (*os.File, error) {
@@ -124,6 +122,20 @@ func createStaticFile(dir, path string) (*os.File, error) {
 	}
 
 	return os.Create(filename)
+}
+
+func writeStaticPage(f io.WriteCloser, page []byte) error {
+	n, err := f.Write(page)
+	if err == nil && n != len(page) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
+		err = errors.New("writing page failed").WithTag("bytes-written", n).Wrap(err)
+	}
+	if closeErr := f.Close(); closeErr != nil {
+		err = stderrors.Join(err, errors.New("closing page file failed").Wrap(closeErr))
+	}
+	return err
 }
 
 func createStaticPage(path string) ([]byte, error) {
@@ -141,6 +153,13 @@ func createStaticPage(path string) ([]byte, error) {
 			Wrap(err)
 	}
 	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		return nil, errors.New("unexpected http response status").
+			WithTag("path", path).
+			WithTag("status-code", res.StatusCode).
+			WithTag("status", res.Status)
+	}
 
 	body, err := io.ReadAll(res.Body)
 	if err != nil {
