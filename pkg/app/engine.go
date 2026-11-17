@@ -32,7 +32,10 @@ type engineX struct {
 
 	dispatches chan func()
 	defers     chan func()
-	goroutines sync.WaitGroup
+
+	asyncMu    sync.Mutex
+	asyncCount int
+	asyncDone  chan struct{}
 
 	asynchronousActionHandlers map[string]ActionHandler
 	actions                    actionManager
@@ -99,9 +102,9 @@ func (e *engineX) baseContext() Context {
 }
 
 // Navigate directs the engine to the specified URL destination, which might be
-// an internal page within the app, an external link outside the app, or a
-// mailto link. If the 'updateHistory' flag is true, the destination is added to
-// the browser's history.
+// an internal page within the app, an external link outside the app, a mailto
+// link, or a tel link. If the 'updateHistory' flag is true, the destination is
+// added to the browser's history.
 func (e *engineX) Navigate(destination *url.URL, updateHistory bool) {
 	if destination.Host == "" {
 		destination.Host = e.originPage.URL().Host
@@ -109,7 +112,8 @@ func (e *engineX) Navigate(destination *url.URL, updateHistory bool) {
 
 	switch {
 	case e.internalURL(destination),
-		e.mailTo(destination):
+		e.mailTo(destination),
+		e.tel(destination):
 		Window().Get("location").Set("href", destination.String())
 		return
 
@@ -174,6 +178,10 @@ func (e *engineX) externalNavigation(v *url.URL) bool {
 
 func (e *engineX) mailTo(v *url.URL) bool {
 	return v.Scheme == "mailto"
+}
+
+func (e *engineX) tel(v *url.URL) bool {
+	return v.Scheme == "tel"
 }
 
 func (e *engineX) internalURL(v *url.URL) bool {
@@ -259,8 +267,11 @@ func (e *engineX) Start(framerate int) {
 }
 
 func (e *engineX) processFrame() {
+	if e.ctx.Err() != nil {
+		return
+	}
 	e.updates.UpdateForEach(func(c Composer) {
-		if !c.Mounted() {
+		if e.ctx.Err() != nil || !c.Mounted() {
 			return
 		}
 
@@ -269,14 +280,20 @@ func (e *engineX) processFrame() {
 		}
 	})
 	e.executeDefers()
+	if e.ctx.Err() != nil {
+		return
+	}
 	e.actions.Cleanup()
 	e.states.Cleanup()
 }
 
 func (e *engineX) executeDefers() {
-	for {
+	for e.ctx.Err() == nil {
 		select {
 		case defere := <-e.defers:
+			if e.ctx.Err() != nil {
+				return
+			}
 			defere()
 
 		default:
@@ -287,26 +304,41 @@ func (e *engineX) executeDefers() {
 
 // ConsumeNext waits for any ongoing goroutines to finish, then executes the
 // next dispatch in the queue. After executing the dispatch, it processes a
-// frame.
+// frame. Cancellation stops either wait.
 func (e *engineX) ConsumeNext() {
-	e.goroutines.Wait()
-	dispatch := <-e.dispatches
-	dispatch()
-	e.processFrame()
+	if !e.waitAsync(e.ctx) {
+		return
+	}
+
+	select {
+	case dispatch := <-e.dispatches:
+		if e.ctx.Err() != nil {
+			return
+		}
+		dispatch()
+		e.processFrame()
+
+	case <-e.ctx.Done():
+	}
 }
 
 // ConsumeAll continuously waits for ongoing goroutines to finish, executes all
 // available dispatches in the queue until none are left, and then processes a
-// frame.
+// frame. Cancellation stops consumption without waiting for async work to finish.
 func (e *engineX) ConsumeAll() {
-	for {
+	for e.ctx.Err() == nil {
 		select {
 		case dispatch := <-e.dispatches:
+			if e.ctx.Err() != nil {
+				return
+			}
 			dispatch()
 
 		default:
 			e.processFrame()
-			e.goroutines.Wait()
+			if !e.waitAsync(e.ctx) {
+				return
+			}
 			if len(e.dispatches) == 0 {
 				return
 			}
@@ -346,17 +378,62 @@ func (e *engineX) Encode(w *bytes.Buffer, document HTMLHtml) error {
 }
 
 func (e *engineX) dispatch(v func()) {
-	e.dispatches <- v
+	if e.ctx.Err() != nil {
+		return
+	}
+	select {
+	case e.dispatches <- v:
+	case <-e.ctx.Done():
+	}
 }
 
 func (e *engineX) defere(v func()) {
-	e.defers <- v
+	if e.ctx.Err() != nil {
+		return
+	}
+	select {
+	case e.defers <- v:
+	case <-e.ctx.Done():
+	}
 }
 
 func (e *engineX) async(v func()) {
-	e.goroutines.Add(1)
+	e.asyncMu.Lock()
+	if e.asyncCount == 0 {
+		e.asyncDone = make(chan struct{})
+	}
+	e.asyncCount++
+	e.asyncMu.Unlock()
+
 	go func() {
+		defer func() {
+			e.asyncMu.Lock()
+			defer e.asyncMu.Unlock()
+			e.asyncCount--
+			if e.asyncCount == 0 {
+				close(e.asyncDone)
+			}
+		}()
 		v()
-		e.goroutines.Done()
 	}()
+}
+
+// waitAsync waits for the current batch of async work, including nested work.
+// It returns false if the supplied context is canceled.
+func (e *engineX) waitAsync(ctx context.Context) bool {
+	e.asyncMu.Lock()
+	done := e.asyncDone
+	e.asyncMu.Unlock()
+
+	if done == nil {
+		return ctx.Err() == nil
+	}
+
+	select {
+	case <-done:
+		return ctx.Err() == nil
+
+	case <-ctx.Done():
+		return false
+	}
 }
